@@ -16,6 +16,9 @@ from transformers import (
 from transformers.image_utils import load_image
 from torch.cuda.amp import autocast  # For mixed precision
 
+# Import quantization to dynamically quantize the vision model
+import torch.quantization
+
 
 class VoiceToVoicePipeline:
     def __init__(
@@ -68,9 +71,20 @@ class VoiceToVoicePipeline:
             _attn_implementation="flash_attention_2" if self.device == "cuda" else "eager",
         ).to(self.device)
         self.vision_model.eval()  # Set to evaluation mode
+
+        # ---- DYNAMIC QUANTIZATION FOR THE VISION MODEL ----
+        # We apply dynamic quantization to reduce CPU memory usage and CPU load.
+        # (Only affects linear layers by default.)
+        self.vision_model = torch.quantization.quantize_dynamic(
+            self.vision_model,
+            {torch.nn.Linear},
+            dtype=torch.qint8
+        )
+        # --------------------------------------------------
+
         self.vision_model_init_time = time.perf_counter() - start_time
 
-        # Initialize Moonshine for Speech-to-Text
+        # Initialize Moonshine for Speech-to-Text (NO QUANTIZATION APPLIED HERE)
         start_time = time.perf_counter()
         self.moonshine_model = MoonshineForConditionalGeneration.from_pretrained(moonshine_model_name).to(self.device)
         self.moonshine_model.eval()  # Set to evaluation mode
@@ -87,7 +101,7 @@ class VoiceToVoicePipeline:
         ]
         self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.vision_patterns]
 
-        # Initialize a dictionary to store timing information
+        # Dictionary to store timing information
         self.timing_info = {}
 
     def transcribe_audio(self, audio_path):
@@ -178,7 +192,8 @@ class VoiceToVoicePipeline:
         if not os.path.exists(self.images_folder):
             raise FileNotFoundError(f"Images folder '{self.images_folder}' does not exist.")
 
-        images = [file for file in os.listdir(self.images_folder) if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+        images = [file for file in os.listdir(self.images_folder)
+                  if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
         if not images:
             raise FileNotFoundError(f"No images found in folder '{self.images_folder}'.")
 
@@ -202,7 +217,7 @@ class VoiceToVoicePipeline:
         start_time = time.perf_counter()
         image = load_image(image_path)
 
-        # Further resize image to reduce processing time (e.g., 128x128)
+        # Further resize image to reduce processing time
         resize_start = time.perf_counter()
         image = image.resize((128, 128))  # Further reduced size
         resize_time = time.perf_counter() - resize_start
@@ -430,6 +445,8 @@ class VoiceToVoicePipeline:
 
 if __name__ == "__main__":
     import argparse
+    import cProfile
+    import pstats
 
     parser = argparse.ArgumentParser(description="Voice to Voice Pipeline with Timing and Control Flags")
     parser.add_argument("--input_audio", type=str, required=True, help="Path to the input audio file.")
@@ -438,23 +455,32 @@ if __name__ == "__main__":
     parser.add_argument("--voice_gen", action='store_true', help="Enable speech generation.")
     parser.add_argument("--no_voice_gen", action='store_false', dest='voice_gen', help="Disable speech generation.")
     parser.set_defaults(voice_gen=True)
-    parser.add_argument("--max_audio_files", type=int, default=None, help="Maximum number of audio files to generate per response.")
+    parser.add_argument("--max_audio_files", type=int, default=None,
+                        help="Maximum number of audio files to generate per response.")
     args = parser.parse_args()
 
-    # Initialize the pipeline
-    pipeline = VoiceToVoicePipeline(
-        lang_code='a',
-        voice='af_bella',
-        images_folder=args.images_folder,
-        vision_model_name="HuggingFaceTB/SmolVLM-256M-Instruct",
-        moonshine_model_name="UsefulSensors/moonshine-tiny",
-        device=None,  # Automatically detects 'cuda' or 'cpu'
-        voice_gen=args.voice_gen,
-        max_audio_files=args.max_audio_files
-    )
+    def main():
+        # Initialize the pipeline
+        pipeline = VoiceToVoicePipeline(
+            lang_code='a',
+            voice='af_bella',
+            images_folder=args.images_folder,
+            vision_model_name="HuggingFaceTB/SmolVLM-256M-Instruct",
+            moonshine_model_name="UsefulSensors/moonshine-tiny",
+            device=None,  # Automatically detects 'cuda' or 'cpu'
+            voice_gen=args.voice_gen,
+            max_audio_files=args.max_audio_files
+        )
 
-    # Handle the audio input
-    pipeline.handle_audio_input(args.input_audio, args.output_audio)
+        # Handle the audio input
+        pipeline.handle_audio_input(args.input_audio, args.output_audio)
 
-    # Print timing information
-    pipeline.print_timing_info()
+        # Print timing information
+        pipeline.print_timing_info()
+
+    # ---- cProfile PROFILING ----
+    with cProfile.Profile() as pr:
+        main()
+    stats = pstats.Stats(pr).sort_stats("tottime")
+    # Print top 20 functions sorted by total time
+    stats.print_stats(20)
